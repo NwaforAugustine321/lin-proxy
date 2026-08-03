@@ -47,12 +47,18 @@ class TunnelServer:
 
     async def handle_proxy(self, request):
         tunnel_id = request.match_info["tunnel_id"]
+        if tunnel_id in ("ws", "api"):
+            return web.Response(status=404, text="Not found")
         if tunnel_id not in self.tunnels:
             return web.Response(status=502, text="Tunnel not connected")
 
         ws = self.tunnels[tunnel_id]
         req_id = str(uuid.uuid4())
-        path = "/" + request.match_info.get("path", "")
+        path = request.match_info.get("path", "")
+        if path and not path.startswith("/"):
+            path = "/" + path
+        if not path:
+            path = "/"
         body = await request.read()
 
         future = asyncio.get_event_loop().create_future()
@@ -94,6 +100,7 @@ class TunnelServer:
         app.router.add_get("/ws", self.handle_client_ws)
         app.router.add_get("/api/tunnels", self.handle_list)
         app.router.add_get("/api/health", self.handle_health)
+        app.router.add_route("*", "/{tunnel_id}", self.handle_proxy)
         app.router.add_route("*", "/{tunnel_id}/{path:.*}", self.handle_proxy)
         print(f"Tunnel server on port {self.public_port} | domain: {self.base_domain}")
         web.run_app(app, port=self.public_port)
