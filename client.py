@@ -1,10 +1,16 @@
 import asyncio
 import json
 import sys
+import os
 import ssl
 import argparse
 import certifi
 import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+DEFAULT_SERVER = os.environ.get("TUNNEL_SERVER", "ws://localhost:9000/ws")
 
 
 def create_ssl_context():
@@ -198,7 +204,7 @@ def main():
         usage="python client.py [-s SERVER] [--spa PORTS] [PORT ...]"
     )
     parser.add_argument("ports", nargs="*", type=int, help="Initial port(s) to expose")
-    parser.add_argument("-s", "--server", default="ws://localhost:9000/ws", help="Tunnel server URL")
+    parser.add_argument("-s", "--server", default=DEFAULT_SERVER, help="Tunnel server URL (default: from .env)")
     parser.add_argument("--spa", nargs="*", type=int, default=[], metavar="PORT", help="Ports to treat as SPA (fallback to index.html)")
     args = parser.parse_args()
 

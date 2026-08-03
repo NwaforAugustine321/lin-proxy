@@ -1,5 +1,5 @@
 import asyncio
-import sys
+import os
 import json
 import uuid
 import string
@@ -12,26 +12,23 @@ class TunnelServer:
         self.public_port = public_port
         self.base_domain = base_domain
         self.tunnels = {}
-        self.subdomain_map = {}
         self.pending_requests = {}
 
-    def generate_subdomain(self):
+    def generate_id(self):
         chars = string.ascii_lowercase + string.digits
         while True:
-            sub = ''.join(random.choices(chars, k=6))
-            if sub not in self.subdomain_map:
-                return sub
+            tid = ''.join(random.choices(chars, k=6))
+            if tid not in self.tunnels:
+                return tid
 
     async def handle_client_ws(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        tunnel_id = str(uuid.uuid4())[:8]
-        subdomain = self.generate_subdomain()
-        self.tunnels[tunnel_id] = {"ws": ws, "subdomain": subdomain}
-        self.subdomain_map[subdomain] = tunnel_id
+        tunnel_id = self.generate_id()
+        self.tunnels[tunnel_id] = ws
 
-        public_url = f"https://{subdomain}.{self.base_domain}"
-        await ws.send_json({"type": "registered", "tunnel_id": tunnel_id, "subdomain": subdomain, "url": public_url})
+        public_url = f"https://{self.base_domain}/{tunnel_id}"
+        await ws.send_json({"type": "registered", "tunnel_id": tunnel_id, "url": public_url})
         print(f"[+] Tunnel {tunnel_id} → {public_url}")
 
         try:
@@ -44,40 +41,18 @@ class TunnelServer:
                 elif msg.type == WSMsgType.ERROR:
                     break
         finally:
-            self.subdomain_map.pop(subdomain, None)
             del self.tunnels[tunnel_id]
             print(f"[-] Tunnel {tunnel_id} disconnected")
         return ws
 
-    def resolve_tunnel(self, request):
-        host = request.headers.get("Host", "")
-        subdomain = host.split(".")[0] if "." in host else None
-        if subdomain and subdomain in self.subdomain_map:
-            return self.subdomain_map[subdomain]
-
-        tunnel_id = request.match_info.get("tunnel_id")
-        if tunnel_id and tunnel_id in self.tunnels:
-            return tunnel_id
-        return None
-
-    async def handle_subdomain_request(self, request):
-        host = request.headers.get("Host", "")
-        subdomain = host.split(".")[0] if "." in host else None
-        if not subdomain or subdomain not in self.subdomain_map:
-            return web.Response(status=404, text="Tunnel not found")
-        tunnel_id = self.subdomain_map[subdomain]
-        return await self._proxy(request, tunnel_id, request.path)
-
-    async def handle_path_request(self, request):
+    async def handle_proxy(self, request):
         tunnel_id = request.match_info["tunnel_id"]
         if tunnel_id not in self.tunnels:
             return web.Response(status=502, text="Tunnel not connected")
-        path = "/" + request.match_info.get("path", "")
-        return await self._proxy(request, tunnel_id, path)
 
-    async def _proxy(self, request, tunnel_id, path):
-        ws = self.tunnels[tunnel_id]["ws"]
+        ws = self.tunnels[tunnel_id]
         req_id = str(uuid.uuid4())
+        path = "/" + request.match_info.get("path", "")
         body = await request.read()
 
         future = asyncio.get_event_loop().create_future()
@@ -107,23 +82,25 @@ class TunnelServer:
 
     async def handle_list(self, request):
         tunnels = []
-        for tid, info in self.tunnels.items():
-            tunnels.append({"tunnel_id": tid, "subdomain": info["subdomain"], "url": f"https://{info['subdomain']}.{self.base_domain}"})
+        for tid in self.tunnels:
+            tunnels.append({"tunnel_id": tid, "url": f"https://{self.base_domain}/{tid}"})
         return web.json_response(tunnels)
+
+    async def handle_health(self, request):
+        return web.json_response({"status": "ok", "tunnels": len(self.tunnels)})
 
     def run(self):
         app = web.Application()
         app.router.add_get("/ws", self.handle_client_ws)
         app.router.add_get("/api/tunnels", self.handle_list)
-        app.router.add_route("*", "/t/{tunnel_id}/{path:.*}", self.handle_path_request)
-        app.router.add_route("*", "/{path:.*}", self.handle_subdomain_request)
-        print(f"Tunnel server on port {self.public_port} | domain: *.{self.base_domain}")
+        app.router.add_get("/api/health", self.handle_health)
+        app.router.add_route("*", "/{tunnel_id}/{path:.*}", self.handle_proxy)
+        print(f"Tunnel server on port {self.public_port} | domain: {self.base_domain}")
         web.run_app(app, port=self.public_port)
 
 
 if __name__ == "__main__":
     import argparse
-    import os
     parser = argparse.ArgumentParser(description="Tunnel relay server")
     parser.add_argument("-p", "--port", type=int, default=int(os.environ.get("PORT", 9000)))
     parser.add_argument("-d", "--domain", default=os.environ.get("TUNNEL_DOMAIN", "localhost"))
