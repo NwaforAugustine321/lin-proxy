@@ -48,7 +48,11 @@ class TunnelConnection:
     async def connect(self):
         while self.reconnect:
             try:
-                self.ws = await self.session.ws_connect(self.server_url, ssl=self.ssl_ctx)
+                url = self.server_url
+                if self.tunnel_id:
+                    sep = "&" if "?" in url else "?"
+                    url = f"{url}{sep}id={self.tunnel_id}"
+                self.ws = await self.session.ws_connect(url, ssl=self.ssl_ctx, heartbeat=20)
                 async for msg in self.ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
@@ -58,11 +62,14 @@ class TunnelConnection:
                             print(f"  {self.local_port} → {self.public_url}")
                         elif data["type"] == "request":
                             response = await self.forward_request(data)
-                            await self.ws.send_json(response)
+                            try:
+                                await self.ws.send_json(response)
+                            except (ConnectionError, aiohttp.ClientError):
+                                break
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                         break
-            except aiohttp.ClientError as e:
-                print(f"  {self.local_port} → connection failed: {e}")
+            except (aiohttp.ClientError, ConnectionError, OSError) as e:
+                print(f"  {self.local_port} → connection lost: {e}")
 
             if self.reconnect:
                 print(f"  {self.local_port} → reconnecting in 3s...")

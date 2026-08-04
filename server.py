@@ -24,7 +24,16 @@ class TunnelServer:
     async def handle_client_ws(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        tunnel_id = self.generate_id()
+
+        # Check if client is requesting a specific tunnel ID (reconnect)
+        requested_id = request.query.get("id")
+        if requested_id and requested_id in self.tunnels:
+            tunnel_id = requested_id
+        elif requested_id and requested_id not in self.tunnels:
+            tunnel_id = requested_id
+        else:
+            tunnel_id = self.generate_id()
+
         self.tunnels[tunnel_id] = ws
 
         public_url = f"https://{self.base_domain}/{tunnel_id}"
