@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sys
 import os
 import ssl
 import argparse
@@ -18,27 +17,14 @@ def create_ssl_context():
     return ctx
 
 
-STATIC_EXTENSIONS = {
-    ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-    ".woff", ".woff2", ".ttf", ".eot", ".map", ".json", ".webp",
-    ".mp4", ".webm", ".ogg", ".mp3", ".wav", ".pdf", ".html", ".htm",
-}
-
-
-def is_static_asset(path):
-    import os
-    ext = os.path.splitext(path.split("?")[0])[1].lower()
-    return ext in STATIC_EXTENSIONS
-
-
 class TunnelConnection:
-    def __init__(self, local_port, server_url, session, ssl_ctx, spa=False):
+    def __init__(self, local_port, server_url, session, ssl_ctx):
         self.local_port = local_port
         self.server_url = server_url
         self.session = session
         self.ssl_ctx = ssl_ctx
-        self.spa = spa
         self.public_url = None
+        self.tunnel_id = None
         self.ws = None
         self.reconnect = True
 
@@ -48,28 +34,13 @@ class TunnelConnection:
                    if k.lower() not in ("host", "connection", "upgrade")}
         try:
             async with self.session.request(data["method"], url, headers=headers, data=data.get("body")) as resp:
-                resp_body = await resp.text()
-                status = resp.status
-
-                if self.spa and status == 404 and not is_static_asset(data["path"]):
-                    fallback_url = f"http://localhost:{self.local_port}/"
-                    async with self.session.request("GET", fallback_url, headers=headers) as fallback_resp:
-                        resp_body = await fallback_resp.text()
-                        status = fallback_resp.status
-                        return {
-                            "req_id": data["req_id"],
-                            "status": status,
-                            "body": resp_body,
-                            "headers": {k: v for k, v in fallback_resp.headers.items()
-                                        if k.lower() not in ("transfer-encoding", "content-encoding")},
-                        }
-
+                resp_body = await resp.read()
                 return {
                     "req_id": data["req_id"],
-                    "status": status,
-                    "body": resp_body,
+                    "status": resp.status,
+                    "body": resp_body.decode("utf-8", errors="replace"),
                     "headers": {k: v for k, v in resp.headers.items()
-                                if k.lower() not in ("transfer-encoding", "content-encoding")},
+                                if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")},
                 }
         except Exception as e:
             return {"req_id": data["req_id"], "status": 502, "body": str(e), "headers": {}}
@@ -83,6 +54,7 @@ class TunnelConnection:
                         data = json.loads(msg.data)
                         if data["type"] == "registered":
                             self.public_url = data["url"]
+                            self.tunnel_id = data.get("tunnel_id")
                             print(f"  {self.local_port} → {self.public_url}")
                         elif data["type"] == "request":
                             response = await self.forward_request(data)
@@ -110,16 +82,13 @@ class TunnelClient:
         self.ssl_ctx = None
         self.running = True
 
-    async def add_port(self, port, spa=False):
+    async def add_port(self, port):
         if port in self.connections:
             print(f"  Port {port} already connected")
             return
-        conn = TunnelConnection(port, self.server_url, self.session, self.ssl_ctx, spa=spa)
+        conn = TunnelConnection(port, self.server_url, self.session, self.ssl_ctx)
         self.connections[port] = conn
-        mode = " (SPA)" if spa else ""
         asyncio.create_task(conn.connect())
-        if spa:
-            print(f"  Port {port} registered as SPA (fallback to index.html)")
 
     async def remove_port(self, port):
         if port not in self.connections:
@@ -135,8 +104,7 @@ class TunnelClient:
             return
         print("  Active tunnels:")
         for port, conn in self.connections.items():
-            spa_tag = " [SPA]" if conn.spa else ""
-            print(f"    {port}{spa_tag} → {conn.public_url or 'connecting...'}")
+            print(f"    {port} → {conn.public_url or 'connecting...'}")
 
     async def command_loop(self):
         loop = asyncio.get_event_loop()
@@ -154,11 +122,9 @@ class TunnelClient:
             cmd = parts[0].lower()
 
             if cmd == "add" and len(parts) >= 2:
-                spa = "--spa" in parts
-                ports_to_add = [p for p in parts[1:] if p != "--spa"]
-                for p in ports_to_add:
+                for p in parts[1:]:
                     try:
-                        await self.add_port(int(p), spa=spa)
+                        await self.add_port(int(p))
                     except ValueError:
                         print(f"  Invalid port: {p}")
             elif cmd == "remove" and len(parts) >= 2:
@@ -173,7 +139,7 @@ class TunnelClient:
                 self.running = False
             elif cmd == "help":
                 print("  Commands:")
-                print("    add <port> [--spa]       Expose local port (--spa for SPA fallback)")
+                print("    add <port> [port ...]    Expose local port(s)")
                 print("    remove <port> [port ...] Stop exposing port(s)")
                 print("    list                     Show active tunnels")
                 print("    quit                     Exit")
@@ -186,8 +152,8 @@ class TunnelClient:
         print(f"Server: {self.server_url}")
         print("Type 'help' for commands.\n")
 
-        for port, spa in initial_ports:
-            await self.add_port(port, spa=spa)
+        for port in initial_ports:
+            await self.add_port(port)
 
         await self.command_loop()
 
@@ -201,20 +167,14 @@ def main():
     parser = argparse.ArgumentParser(
         prog="tunnel",
         description="Expose local ports to the internet",
-        usage="python client.py [-s SERVER] [--spa PORTS] [PORT ...]"
+        usage="python client.py [PORT ...]"
     )
-    parser.add_argument("ports", nargs="*", type=int, help="Initial port(s) to expose")
+    parser.add_argument("ports", nargs="*", type=int, help="Local port(s) to expose")
     parser.add_argument("-s", "--server", default=DEFAULT_SERVER, help="Tunnel server URL (default: from .env)")
-    parser.add_argument("--spa", nargs="*", type=int, default=[], metavar="PORT", help="Ports to treat as SPA (fallback to index.html)")
     args = parser.parse_args()
 
-    all_ports = [(p, p in args.spa) for p in args.ports]
-    for p in args.spa:
-        if p not in args.ports:
-            all_ports.append((p, True))
-
     client = TunnelClient(server_url=args.server)
-    asyncio.run(client.run(all_ports))
+    asyncio.run(client.run(args.ports))
 
 
 if __name__ == "__main__":
