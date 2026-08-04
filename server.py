@@ -89,7 +89,7 @@ class TunnelServer:
         })
 
         try:
-            response_data = await asyncio.wait_for(future, timeout=30)
+            response_data = await asyncio.wait_for(future, timeout=60)
         except asyncio.TimeoutError:
             return web.Response(status=504, text="Tunnel timeout")
         finally:

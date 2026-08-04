@@ -61,11 +61,7 @@ class TunnelConnection:
                             self.tunnel_id = data.get("tunnel_id")
                             print(f"  {self.local_port} → {self.public_url}")
                         elif data["type"] == "request":
-                            response = await self.forward_request(data)
-                            try:
-                                await self.ws.send_json(response)
-                            except (ConnectionError, aiohttp.ClientError):
-                                break
+                            asyncio.create_task(self._handle_request(data))
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                         break
             except (aiohttp.ClientError, ConnectionError, OSError) as e:
@@ -74,6 +70,14 @@ class TunnelConnection:
             if self.reconnect:
                 print(f"  {self.local_port} → reconnecting in 3s...")
                 await asyncio.sleep(3)
+
+    async def _handle_request(self, data):
+        response = await self.forward_request(data)
+        try:
+            if self.ws and not self.ws.closed:
+                await self.ws.send_json(response)
+        except (ConnectionError, aiohttp.ClientError, OSError):
+            pass
 
     async def disconnect(self):
         self.reconnect = False
