@@ -27,6 +27,7 @@ class TunnelConnection:
         self.tunnel_id = None
         self.ws = None
         self.reconnect = True
+        self.local_ws_bridges = {}
 
     async def forward_request(self, data):
         url = f"http://localhost:{self.local_port}{data['path']}"
@@ -56,12 +57,19 @@ class TunnelConnection:
                 async for msg in self.ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
-                        if data["type"] == "registered":
+                        msg_type = data.get("type")
+                        if msg_type == "registered":
                             self.public_url = data["url"]
                             self.tunnel_id = data.get("tunnel_id")
                             print(f"  {self.local_port} → {self.public_url}")
-                        elif data["type"] == "request":
+                        elif msg_type == "request":
                             asyncio.create_task(self._handle_request(data))
+                        elif msg_type == "ws_open":
+                            asyncio.create_task(self._handle_ws_open(data))
+                        elif msg_type == "ws_forward":
+                            asyncio.create_task(self._handle_ws_forward(data))
+                        elif msg_type == "ws_close":
+                            asyncio.create_task(self._handle_ws_close(data))
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                         break
             except (aiohttp.ClientError, ConnectionError, OSError) as e:
@@ -78,6 +86,58 @@ class TunnelConnection:
                 await self.ws.send_json(response)
         except (ConnectionError, aiohttp.ClientError, OSError):
             pass
+
+    async def _handle_ws_open(self, data):
+        bridge_id = data["bridge_id"]
+        path = data.get("path", "/")
+        url = f"ws://localhost:{self.local_port}{path}"
+        try:
+            local_ws = await self.session.ws_connect(url)
+            self.local_ws_bridges[bridge_id] = local_ws
+            asyncio.create_task(self._ws_bridge_reader(bridge_id, local_ws))
+        except Exception as e:
+            try:
+                if self.ws and not self.ws.closed:
+                    await self.ws.send_json({"type": "ws_closed", "bridge_id": bridge_id})
+            except:
+                pass
+
+    async def _ws_bridge_reader(self, bridge_id, local_ws):
+        try:
+            async for msg in local_ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    if self.ws and not self.ws.closed:
+                        await self.ws.send_json({
+                            "type": "ws_message",
+                            "bridge_id": bridge_id,
+                            "data": msg.data,
+                        })
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                    break
+        except:
+            pass
+        finally:
+            self.local_ws_bridges.pop(bridge_id, None)
+            try:
+                if self.ws and not self.ws.closed:
+                    await self.ws.send_json({"type": "ws_closed", "bridge_id": bridge_id})
+            except:
+                pass
+
+    async def _handle_ws_forward(self, data):
+        bridge_id = data["bridge_id"]
+        local_ws = self.local_ws_bridges.get(bridge_id)
+        if local_ws and not local_ws.closed:
+            try:
+                await local_ws.send_str(data["data"])
+            except:
+                pass
+
+    async def _handle_ws_close(self, data):
+        bridge_id = data["bridge_id"]
+        local_ws = self.local_ws_bridges.pop(bridge_id, None)
+        if local_ws and not local_ws.closed:
+            await local_ws.close()
 
     async def disconnect(self):
         self.reconnect = False

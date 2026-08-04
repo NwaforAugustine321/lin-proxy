@@ -13,6 +13,7 @@ class TunnelServer:
         self.base_domain = base_domain
         self.tunnels = {}
         self.pending_requests = {}
+        self.ws_bridges = {}
 
     def generate_id(self):
         chars = string.ascii_lowercase + string.digits
@@ -25,7 +26,6 @@ class TunnelServer:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        # Check if client is requesting a specific tunnel ID (reconnect)
         requested_id = request.query.get("id")
         if requested_id and requested_id in self.tunnels:
             tunnel_id = requested_id
@@ -44,9 +44,19 @@ class TunnelServer:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
                     data = json.loads(msg.data)
+                    msg_type = data.get("type")
                     req_id = data.get("req_id")
-                    if req_id in self.pending_requests:
+
+                    if req_id and req_id in self.pending_requests:
                         self.pending_requests[req_id].set_result(data)
+                    elif msg_type == "ws_message" and data.get("bridge_id") in self.ws_bridges:
+                        bridge_ws = self.ws_bridges[data["bridge_id"]]
+                        if not bridge_ws.closed:
+                            await bridge_ws.send_str(data["data"])
+                    elif msg_type == "ws_closed" and data.get("bridge_id") in self.ws_bridges:
+                        bridge_ws = self.ws_bridges.pop(data["bridge_id"], None)
+                        if bridge_ws and not bridge_ws.closed:
+                            await bridge_ws.close()
                 elif msg.type == WSMsgType.ERROR:
                     break
         finally:
@@ -54,24 +64,27 @@ class TunnelServer:
             print(f"[-] Tunnel {tunnel_id} disconnected")
         return ws
 
-    async def handle_proxy(self, request):
+    def _get_tunnel_for_request(self, request):
         full_path = request.path
-
-        # Check if first segment is a tunnel ID
         parts = full_path.strip("/").split("/", 1)
         tunnel_id = parts[0] if parts else None
 
         if tunnel_id and tunnel_id in self.tunnels:
-            # Strip the tunnel ID from path, forward the rest
             path = "/" + parts[1] if len(parts) > 1 else "/"
-            ws = self.tunnels[tunnel_id]
+            return self.tunnels[tunnel_id], path
         elif len(self.tunnels) == 1:
-            # Only one tunnel connected — forward everything directly
             tunnel_id = next(iter(self.tunnels))
-            ws = self.tunnels[tunnel_id]
-            path = full_path
-        else:
-            return web.Response(status=404, text="Tunnel not found. Use /{tunnel_id}/path or connect a single tunnel.")
+            return self.tunnels[tunnel_id], full_path
+        return None, None
+
+    async def handle_proxy(self, request):
+        # Check if this is a WebSocket upgrade request
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return await self._handle_ws_bridge(request)
+
+        tunnel_ws, path = self._get_tunnel_for_request(request)
+        if not tunnel_ws:
+            return web.Response(status=404, text="Tunnel not found.")
 
         req_id = str(uuid.uuid4())
         body = await request.read()
@@ -79,7 +92,7 @@ class TunnelServer:
         future = asyncio.get_event_loop().create_future()
         self.pending_requests[req_id] = future
 
-        await ws.send_json({
+        await tunnel_ws.send_json({
             "type": "request",
             "req_id": req_id,
             "method": request.method,
@@ -100,6 +113,45 @@ class TunnelServer:
             body=response_data.get("body", ""),
             headers=response_data.get("headers", {}),
         )
+
+    async def _handle_ws_bridge(self, request):
+        tunnel_ws, path = self._get_tunnel_for_request(request)
+        if not tunnel_ws:
+            return web.Response(status=502, text="No tunnel connected")
+
+        browser_ws = web.WebSocketResponse()
+        await browser_ws.prepare(request)
+
+        bridge_id = str(uuid.uuid4())[:8]
+        self.ws_bridges[bridge_id] = browser_ws
+
+        # Tell tunnel client to open a WebSocket to local server
+        query = request.query_string
+        full_path = f"{path}?{query}" if query else path
+        await tunnel_ws.send_json({
+            "type": "ws_open",
+            "bridge_id": bridge_id,
+            "path": full_path,
+        })
+
+        try:
+            async for msg in browser_ws:
+                if msg.type == WSMsgType.TEXT:
+                    await tunnel_ws.send_json({
+                        "type": "ws_forward",
+                        "bridge_id": bridge_id,
+                        "data": msg.data,
+                    })
+                elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
+                    break
+        finally:
+            self.ws_bridges.pop(bridge_id, None)
+            await tunnel_ws.send_json({
+                "type": "ws_close",
+                "bridge_id": bridge_id,
+            })
+
+        return browser_ws
 
     async def handle_list(self, request):
         tunnels = []
